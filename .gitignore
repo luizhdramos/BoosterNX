@@ -1,0 +1,18 @@
+# Build output (regenerate with scripts/build-switch-msys2.sh)
+/build/
+*.nro
+*.nacp
+*.elf
+*.pfs0
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# devkitPro/CMake local config
+CMakeUserPresets.json
