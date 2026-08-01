@@ -340,7 +340,22 @@ void WebRtcSession::stop_ice_poll_worker() {
 }
 
 void WebRtcSession::setup_peer_connection(const std::vector<IceServerInfo>& ice_servers_in) {
-    std::vector<IceServerInfo> ice_servers = ice_servers_in;
+    // Stored in a member, NOT a local: see ice_servers_' declaration in
+    // webrtc_session.hpp. THE root-cause bug of this whole WebRTC saga was
+    // that this was a local vector — libpeer keeps only the `const char*`
+    // from each entry and dereferences them later, from
+    // peer_connection_create_offer(), by which point a local would have been
+    // destroyed. CONFIRMED on real hardware once libpeer's own logs were
+    // routed to runtime.log: it printed
+    //   ice server: turn:87.121.118.69:3478?transport=udp   (still readable by luck)
+    //   ice server: `<garbage>`  -> "Invalid URL"  x3        (freed and reused)
+    // so every STUN server was silently dropped, and the TURN server's
+    // username/credential — dangling too — were garbage, which is why the
+    // server answered its ALLOCATE with a STUN error. Net effect: the only
+    // candidate ever gathered was the LAN host address, and ICE could not
+    // possibly succeed.
+    std::vector<IceServerInfo>& ice_servers = ice_servers_;
+    ice_servers = ice_servers_in;
 
     // Derive a plain STUN URL from every TURN server Boosteroid gave us.
     // A TURN server answers ordinary STUN Binding requests on the same
@@ -426,9 +441,11 @@ void WebRtcSession::setup_peer_connection(const std::vector<IceServerInfo>& ice_
         config.ice_servers[i].username = ice_servers[i].username.empty() ? nullptr : ice_servers[i].username.c_str();
         config.ice_servers[i].credential = ice_servers[i].credential.empty() ? nullptr : ice_servers[i].credential.c_str();
     }
-    // NOTE: config.ice_servers[i].urls/username/credential point into
-    // `ice_servers` (a local vector) — safe here because peer_connection_create
-    // copies what it needs synchronously before this function returns.
+    // These point into ice_servers_ (a member). peer_connection_create()
+    // shallow-copies the config and keeps the raw pointers, dereferencing
+    // them only later from peer_connection_create_offer() — so the strings
+    // must live at least as long as pc_ does. Do NOT make ice_servers_ a
+    // local again, and do not mutate it after this point.
 
     pc_ = peer_connection_create(&config);
     if (!pc_)

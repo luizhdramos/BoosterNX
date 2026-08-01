@@ -191,6 +191,12 @@ private:
     // while also filling the 100-entry candidate-pair table with duplicate
     // pairs. Track what's already been added and skip repeats.
     std::set<std::string> added_remote_ice_;
+    // MUST outlive pc_. libpeer's IceServer holds bare `const char*` and
+    // peer_connection_create() only does a shallow memcpy of the config —
+    // it dereferences those pointers much later, inside
+    // peer_connection_create_offer(). Keeping the strings in a member (not a
+    // local in setup_peer_connection) is what makes that safe.
+    std::vector<opennow::IceServerInfo> ice_servers_;
     // When the first stream/* burst arrived. Used to hold off the fallback
     // "start WebRTC anyway" path until the server has had a fair chance to
     // send the real settings/webrtc signal — see handle_control_event.
