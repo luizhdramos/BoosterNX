@@ -1,6 +1,7 @@
 #include "webrtc_session.hpp"
 #include "network_loop_policy.hpp"
 #include "internal.hpp"
+#include "runtime_journal.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -44,6 +45,35 @@ bool CreateNvdecCrashMarker()
     marker << "NVDEC stream active; remove after clean shutdown\n";
     marker.flush();
     return marker.good();
+}
+
+// Summarize ICE candidate types found in an SDP (or a single candidate line)
+// as e.g. "host=4 srflx=0 relay=0". This is THE diagnostic that distinguishes
+// "we only ever gathered LAN candidates, so nothing can route" from "we had a
+// public/relayed path and something else broke" — the current open WebRTC bug
+// (SDP exchange completes, addIceCandidate 500s, zero packets ever arrive).
+// Deliberately logged via LogRuntimeEvent (ALWAYS on) rather than the
+// stream_trace flight recorder, which is gated behind the "Debug overlay"
+// setting and requires an app restart — real hardware testing 2026-07-31 kept
+// producing no trace file at all, making this undiagnosable.
+std::string SummarizeCandidateTypes(const std::string& text)
+{
+    int host = 0, srflx = 0, relay = 0, prflx = 0, other = 0;
+    size_t pos = 0;
+    while ((pos = text.find("candidate:", pos)) != std::string::npos)
+    {
+        const size_t line_end = text.find('\n', pos);
+        const std::string line = text.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+        if (line.find(" typ host") != std::string::npos) host++;
+        else if (line.find(" typ srflx") != std::string::npos) srflx++;
+        else if (line.find(" typ relay") != std::string::npos) relay++;
+        else if (line.find(" typ prflx") != std::string::npos) prflx++;
+        else other++;
+        pos += 10;
+    }
+    return "host=" + std::to_string(host) + " srflx=" + std::to_string(srflx) +
+           " relay=" + std::to_string(relay) + " prflx=" + std::to_string(prflx) +
+           " other=" + std::to_string(other);
 }
 
 } // namespace
@@ -147,8 +177,23 @@ void WebRtcSession::handle_control_event(const BoosteroidControlEvent& event) {
             break;
         case Type::SessionActive:
             AppendStreamLog("CONTROL stream/* burst (session active)");
-            if (!webrtc_started_.exchange(true))
-                start_webrtc_media();
+            // The stream/* burst is only a FALLBACK trigger, for the
+            // take-over/switch case where another device already initialized
+            // the session so the server never re-sends settings/webrtc.
+            // CONFIRMED on real hardware 2026-07-31 that firing on it
+            // unconditionally is wrong: a fresh session sent a stream/* burst
+            // at +11.1s and the real settings/webrtc only at +18.1s, so
+            // signaling ran ~7s BEFORE the server's WebRTC engine was ready
+            // (getParams even answered codec=AV1 at that point, while the
+            // eventual answer was H264). Wait for the real signal first and
+            // only fall back if it never comes.
+            // Just record when the burst first arrived; poll() owns the
+            // actual grace-period expiry check (it runs every frame, whereas
+            // bursts may only ever arrive once).
+            if (!webrtc_started_.load() &&
+                first_session_active_at_ == std::chrono::steady_clock::time_point{}) {
+                first_session_active_at_ = std::chrono::steady_clock::now();
+            }
             break;
         case Type::ControllerAck: {
             for (auto& controller : controllers_) {
@@ -193,6 +238,19 @@ void WebRtcSession::start_webrtc_media() {
         const std::vector<IceServerInfo> ice_servers = signaling_->FetchIceServers();
         const auto params = signaling_->FetchParams();
         AppendStreamLog("WEBRTC params codec=" + params.codec + " version=" + std::to_string(params.version));
+        {
+            std::string server_summary;
+            for (const auto& server : ice_servers)
+            {
+                if (!server_summary.empty())
+                    server_summary += ",";
+                // URL only — the TURN username/credential are per-session
+                // secrets and don't belong in a log the user shares.
+                server_summary += server.url;
+            }
+            opennow::LogRuntimeEvent("webrtc", "ice_servers",
+                                      "count=" + std::to_string(ice_servers.size()) + " urls=" + server_summary);
+        }
 
         setup_peer_connection(ice_servers);
         if (!pc_) {
@@ -208,6 +266,7 @@ void WebRtcSession::start_webrtc_media() {
             return;
         }
         AppendTraceBlock("LOCAL OFFER", offer_sdp);
+        opennow::LogRuntimeEvent("webrtc", "local_offer_candidates", SummarizeCandidateTypes(offer_sdp));
         // No separate "set local description" call: peer_connection_create_offer()
         // above already builds pc->sdp and sets pc->b_local_description_created
         // internally (see extern/libpeer/src/peer_connection.c). The header
@@ -218,6 +277,7 @@ void WebRtcSession::start_webrtc_media() {
         current_state_ = "Sending offer";
         const std::string answer_sdp = signaling_->SendOffer(offer_sdp);
         AppendTraceBlock("REMOTE ANSWER", answer_sdp);
+        opennow::LogRuntimeEvent("webrtc", "remote_answer_candidates", SummarizeCandidateTypes(answer_sdp));
         peer_connection_set_remote_description(pc_, answer_sdp.c_str(), SDP_TYPE_ANSWER);
 
         // Answer is set - safe to flush any ICE candidates gathered before now
@@ -251,10 +311,21 @@ void WebRtcSession::start_ice_poll_worker() {
             if (signaling_) {
                 for (const auto& candidate : signaling_->PollRemoteIceCandidates()) {
                     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
-                    if (pc_) {
-                        std::string mutable_candidate = candidate.candidate;
-                        peer_connection_add_ice_candidate(pc_, mutable_candidate.data());
-                    }
+                    if (!pc_)
+                        continue;
+                    // Dedupe: this endpoint returns the node's whole candidate
+                    // list every second, and libpeer never dedupes internally
+                    // (see added_remote_ice_'s comment in webrtc_session.hpp
+                    // for the overflow this caused).
+                    if (!added_remote_ice_.insert(candidate.candidate).second)
+                        continue;
+                    std::string mutable_candidate = candidate.candidate;
+                    const int added = peer_connection_add_ice_candidate(pc_, mutable_candidate.data());
+                    AppendTraceLog("REMOTE candidate added=" + std::to_string(added) + " " + candidate.candidate);
+                    opennow::LogRuntimeEvent(
+                        "webrtc", "remote_candidate_added",
+                        "result=" + std::to_string(added) + " total=" + std::to_string(added_remote_ice_.size()) +
+                        " candidate=" + candidate.candidate.substr(0, 120));
                 }
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -270,13 +341,24 @@ void WebRtcSession::stop_ice_poll_worker() {
 
 void WebRtcSession::setup_peer_connection(const std::vector<IceServerInfo>& ice_servers_in) {
     std::vector<IceServerInfo> ice_servers = ice_servers_in;
-    if (ice_servers.empty()) {
-        // Generic public STUN fallback only - never a GFN/NVIDIA-specific
-        // host, and Boosteroid's own TURN servers (from getIceServers) are
-        // what actually relays media in practice.
-        ice_servers.push_back({"stun:stun.l.google.com:19302", "", ""});
-        ice_servers.push_back({"stun:stun1.l.google.com:19302", "", ""});
-    }
+    // ALWAYS append public STUN, not just when Boosteroid gave us nothing.
+    // CONFIRMED root-cause evidence on real hardware 2026-07-31: getIceServers
+    // returns exactly ONE server and it is a TURN one
+    // ("turn:87.121.118.69:3478?transport=udp") with no STUN at all. libpeer
+    // only derives a server-reflexive candidate from a `stun:` URL
+    // (agent_gather_candidate branches on the scheme), and its TURN ALLOCATE
+    // produced no relay candidate either — so the local offer went out with
+    // literally one candidate, a LAN address:
+    //   "candidate:0 1 UDP ... 192.168.15.95 23638 typ host"
+    //   (runtime.log: local_offer_candidates host=1 srflx=0 relay=0)
+    // A public cloud host cannot route to a 192.168.x.x address, so ICE had
+    // nothing to work with and the peer went checking -> failed with zero
+    // packets. Adding STUN gets us an srflx candidate carrying our real
+    // public IP/port, which is what the server actually needs. This is
+    // additive and harmless if TURN also succeeds — ICE picks whichever pair
+    // works and prefers the lower-latency one.
+    ice_servers.push_back({"stun:stun.l.google.com:19302", "", ""});
+    ice_servers.push_back({"stun:stun1.l.google.com:19302", "", ""});
 
     PeerConfiguration config = {};
     config.video_codec = CODEC_H264;
@@ -350,6 +432,23 @@ void WebRtcSession::poll() {
         return;
 
     control_channel_.Poll();
+
+    // Fallback trigger for the take-over/switch case, where the server never
+    // re-sends settings/webrtc because another device already initialized the
+    // session. Checked here (called every frame) rather than only inside
+    // handle_control_event, since there's no guarantee a second stream/*
+    // burst ever arrives to re-evaluate it — see handle_control_event's
+    // SessionActive case for why waiting for the real signal comes first.
+    if (!webrtc_started_.load() &&
+        first_session_active_at_ != std::chrono::steady_clock::time_point{}) {
+        constexpr auto kWebrtcSignalGrace = std::chrono::seconds(20);
+        if (std::chrono::steady_clock::now() - first_session_active_at_ >= kWebrtcSignalGrace) {
+            AppendStreamLog("CONTROL settings/webrtc never arrived - starting on stream/* fallback");
+            opennow::LogRuntimeEvent("webrtc", "start_fallback", "reason=settings_webrtc_timeout");
+            if (!webrtc_started_.exchange(true))
+                start_webrtc_media();
+        }
+    }
 
     std::lock_guard<std::recursive_mutex> lock(peer_mutex_);
     if (pc_) {
@@ -462,6 +561,14 @@ void WebRtcSession::on_ice_candidate(const std::string& sdp) {
 void WebRtcSession::on_peer_state_change(PeerConnectionState state) {
     current_state_ = std::string("Peer ") + peer_connection_state_to_string(state);
     AppendStreamLog("PEER state " + std::string(peer_connection_state_to_string(state)));
+    // Always-on (see SummarizeCandidateTypes' comment): the peer state
+    // transition to "failed" with zero received packets is the current open
+    // bug's signature, and it needs to be visible in runtime.log without the
+    // Debug-overlay setting being on.
+    opennow::LogRuntimeEvent("webrtc", "peer_state",
+                              std::string(peer_connection_state_to_string(state)) +
+                              " packets=" + std::to_string(packets_received_.load()) +
+                              " frames=" + std::to_string(frames_decoded_.load()));
 }
 
 std::string WebRtcSession::get_debug_info() const {

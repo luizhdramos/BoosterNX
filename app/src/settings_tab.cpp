@@ -2,6 +2,7 @@
 
 #include "app_state.hpp"
 #include "localization.hpp"
+#include "stream_diagnostics.hpp"
 #include "stream_settings.hpp"
 #include "ui_helpers.hpp"
 
@@ -390,6 +391,13 @@ bool SettingsTab::SaveChanges(brls::View* view)
     {
         saved_settings_ = draft_settings_;
         dirty_ = false;
+        // BUG FIXED 2026-07-31: this was only ever applied at boot
+        // (main.cpp's SetStreamDiagnosticsEnabled call), so toggling "Debug
+        // overlay" On and saving did nothing until the app was fully
+        // restarted — and every log the flight recorders write is gated on
+        // it, so the expected stream_trace.log simply never appeared.
+        // CONFIRMED on real hardware. Apply it here too, immediately.
+        SetStreamDiagnosticsEnabled(draft_settings_.debug_diagnostics);
         save_status_->setText(Tr("Saved"));
         save_status_->setTextColor(nvgRGB(105, 220, 148));
     }

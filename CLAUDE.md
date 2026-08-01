@@ -60,15 +60,38 @@ CONFIRMED on real hardware as of 2026-07-31:
   `call` all succeed (200, real SDP answer received), but both
   `addIceCandidate` POSTs come back **HTTP 500**, and the connection never
   reports any received packets (`state=peer failed packed=0 frames=0`) —
-  this is the current open bug. `addIceCandidate` failures are logged as
-  fire-and-forget (matching the tvOS client's own behavior) so they may be a
-  red herring; more likely the real cause is that only `host` (LAN/NAT)
-  candidates are being gathered with no working `srflx`/`relay` candidate
-  reaching the peer, which would explain zero packets despite a completed
-  SDP exchange. Needs a `stream_trace.log` pull (Settings → Stream →
-  Diagnostics → "Debug overlay" must be ON, which requires an app restart to
-  take effect) showing the actual local SDP's candidate types to diagnose
-  further — not yet captured.
+  the current open bug. Two findings from the 2026-07-31 pass:
+  - **A real bug was found and fixed in the remote-ICE poll loop** (leading
+    candidate for the actual root cause, not yet re-tested on hardware):
+    `getIceCandidate` is a POLL that returns the node's ENTIRE current
+    candidate list on every call (CONFIRMED: byte-identical 571-byte body
+    every second), but `start_ice_poll_worker()` fed every response straight
+    into `peer_connection_add_ice_candidate()` with no dedupe — and libpeer
+    doesn't dedupe either. Its remote table is a fixed **10** entries
+    (`AGENT_MAX_CANDIDATES`, extern/libpeer/src/agent.h) and the pair table
+    **100** (`AGENT_MAX_CANDIDATE_PAIRS`), so within a few seconds both
+    overflowed with duplicates of the same handful of candidates
+    ("Remote ICE candidate table is full") while connectivity checks
+    thrashed across duplicate pairs. Fixed with `added_remote_ice_`
+    (webrtc_session.hpp).
+  - `addIceCandidate`'s 500 may still be a separate (possibly harmless)
+    issue — its request body shape is UNCONFIRMED, assumed from the upstream
+    webrtc-streamer OSS convention. It's fire-and-forget by design (matching
+    the tvOS client), and ICE can still converge without it since the server
+    can learn our address as a peer-reflexive candidate from our own binding
+    requests. The response body is now logged rather than discarded.
+- **Diagnostics are deliberately in `runtime.log`, not just the trace log**:
+  the flight recorders (`stream_trace.log`/`signaling.log`/`input.log`, see
+  `webrtc/log.cpp`) are all gated behind `StreamDiagnosticsEnabled()`, which
+  until 2026-07-31 was ONLY applied at boot (`main.cpp`) — toggling
+  Settings → Stream → "Debug overlay" and saving did nothing until a full
+  app restart, so the expected trace file simply never appeared (CONFIRMED
+  on real hardware; fixed by also applying it in `SettingsTab::SaveChanges`).
+  Because of that trap, the WebRTC facts that matter for this bug — ICE
+  server list, local-offer/remote-answer candidate type counts
+  (`host=/srflx=/relay=`), every remote candidate added, `addIceCandidate`
+  failures, and peer state transitions — are logged via `LogRuntimeEvent`,
+  which is always on and needs no setting.
 
 Treat the file-by-file notes below as still-accurate background on what was
 ported and from where, but not as the current build/run status.

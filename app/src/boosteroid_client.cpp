@@ -510,6 +510,17 @@ SessionInfo BoosteroidClient::CreateAndAwaitSession(
     // confirmation (StartStreamingSession) right here.
     std::unique_ptr<WebSocketClient> realtime_ws;
     bool realtime_confirmation_attempted = false;
+    // Live queue position/ETA, pushed over this same socket. CONFIRMED (see
+    // BoosteroidATV's CLAUDE.md) that the number the web UI shows as "Posição
+    // na fila" comes ONLY from here — there is no REST endpoint for it, which
+    // is why the launch dialog previously could only say "queueing a machine
+    // for you" with no number. The exact type/action strings routing a
+    // position update were never isolated, so match on the VALUE SHAPE
+    // (a `position` field) rather than on type/action, same fallback approach
+    // BoosteroidRealtimeClient.swift takes.
+    int realtime_queue_position = -1;
+    int realtime_queue_eta = -1;
+    bool realtime_queue_position_changed = false;
     if (realtime_uid.empty() || realtime_access_token.empty())
     {
         // DIAGNOSTIC (added 2026-07-31): the first attempt at this fix had no
@@ -524,7 +535,9 @@ SessionInfo BoosteroidClient::CreateAndAwaitSession(
     {
         realtime_ws = std::make_unique<WebSocketClient>(
             "wss://cloud.boosteroid.com/ws?uid=" + realtime_uid + "&token=" + realtime_access_token);
-        realtime_ws->set_on_message([this, &realtime_confirmation_attempted, app_id, &cookies](const std::string& text) {
+        realtime_ws->set_on_message([this, &realtime_confirmation_attempted, app_id, &cookies,
+                                     &realtime_queue_position, &realtime_queue_eta,
+                                     &realtime_queue_position_changed](const std::string& text) {
             // DIAGNOSTIC: log every inbound message (truncated) regardless of
             // whether it matches queues/start, so a runtime.log capture can
             // show the REAL message shape if the queues/start match below
@@ -532,28 +545,47 @@ SessionInfo BoosteroidClient::CreateAndAwaitSession(
             // BoosteroidATV's CLAUDE.md, not captured directly for this app).
             LogRuntimeEvent("session", "realtime_message", Preview(text));
 
-            if (realtime_confirmation_attempted)
-                return; // One-shot: StartStreamingSession must never be retried (429 lockout risk).
-
             JsonPtr root = TryLoad(text);
             if (!root)
                 return;
             json_t* msg = root.get();
             const std::string type = GetString(msg, "type");
             const std::string action = GetString(msg, "action");
+            json_t* value = json_object_get(msg, "value");
+            json_t* body = (value && json_is_object(value)) ? value : msg;
+
+            // Queue position update — matched on shape (a `position` field for
+            // our appId), NOT on type/action, since the exact routing strings
+            // are unconfirmed. Handled BEFORE the queues/start early-return
+            // below so positions keep updating for the whole wait.
+            if (json_is_integer(json_object_get(body, "position")))
+            {
+                const int pushed_app_id = GetInteger(body, "appId", app_id);
+                if (pushed_app_id == app_id)
+                {
+                    const int position = GetInteger(body, "position", -1);
+                    if (position != realtime_queue_position)
+                    {
+                        realtime_queue_position = position;
+                        realtime_queue_position_changed = true;
+                    }
+                    if (json_is_integer(json_object_get(body, "eta")))
+                        realtime_queue_eta = GetInteger(body, "eta", -1);
+                }
+            }
+
+            if (realtime_confirmation_attempted)
+                return; // One-shot: StartStreamingSession must never be retried (429 lockout risk).
+
             if (type != "queues" || action != "start")
                 return;
 
-            // Fields have been observed described as {appId, token} on the
-            // queues/start push itself; be lenient and also check a nested
-            // "value" object in case the exact nesting differs from a plain
-            // top-level pair (unconfirmed at that level of detail — see
-            // boosteroid_client.hpp's CreateAndAwaitSession doc comment).
-            json_t* fields = json_object_get(msg, "value");
-            if (!fields || !json_is_object(fields))
-                fields = msg;
-            const int pushed_app_id = GetInteger(fields, "appId", -1);
-            const std::string token = GetString(fields, "token");
+            // CONFIRMED shape by live capture 2026-07-31:
+            // {"type":"queues","action":"start","value":{"appId":<int>,
+            //  "token":"<uuid>"}} — `body` above already resolves the nested
+            // "value" object (falling back to the top level if absent).
+            const int pushed_app_id = GetInteger(body, "appId", -1);
+            const std::string token = GetString(body, "token");
             if (pushed_app_id != app_id || token.empty())
                 return;
 
@@ -639,6 +671,24 @@ SessionInfo BoosteroidClient::CreateAndAwaitSession(
             slept_ms += chunk;
             if (!preferred_session_id_.empty() && !reacted_to_confirmation)
                 break;
+            // Push a fresh queue position to the UI the moment it changes,
+            // instead of making the user stare at an unchanging "queueing a
+            // machine for you" until the next 60s REST poll. Deliberately does
+            // NOT count as a poll `attempt` — it's a cosmetic update, not
+            // queue progress the loop below reasons about.
+            if (realtime_queue_position_changed && on_poll)
+            {
+                realtime_queue_position_changed = false;
+                SessionInfo queued = current;
+                queued.status = "EN";
+                queued.queue_position = realtime_queue_position;
+                queued.queue_eta_seconds = realtime_queue_eta;
+                LogRuntimeEvent("session", "realtime_queue_position",
+                                 "position=" + std::to_string(realtime_queue_position) +
+                                 " eta=" + std::to_string(realtime_queue_eta));
+                if (!on_poll(queued, attempt))
+                    throw BoosteroidClientError("createAndAwaitSession: cancelled");
+            }
         }
         attempt++;
 

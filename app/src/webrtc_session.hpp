@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 #include <chrono>
@@ -180,6 +181,20 @@ private:
     std::vector<PendingIce> pending_local_ice_;
     std::thread ice_poll_thread_;
     std::atomic<bool> ice_poll_running_ {false};
+    // getIceCandidate is a POLL, not a queue that drains — it returns the
+    // node's FULL current candidate list on every call (CONFIRMED on real
+    // hardware 2026-07-31: an identical 571-byte body every single second).
+    // Feeding that straight into peer_connection_add_ice_candidate re-adds
+    // the same candidates once per second, and libpeer's remote table is a
+    // fixed 10 entries (AGENT_MAX_CANDIDATES) that it never dedupes — so it
+    // overflowed within seconds ("Remote ICE candidate table is full"),
+    // while also filling the 100-entry candidate-pair table with duplicate
+    // pairs. Track what's already been added and skip repeats.
+    std::set<std::string> added_remote_ice_;
+    // When the first stream/* burst arrived. Used to hold off the fallback
+    // "start WebRTC anyway" path until the server has had a fair chance to
+    // send the real settings/webrtc signal — see handle_control_event.
+    std::chrono::steady_clock::time_point first_session_active_at_ {};
 
     std::string current_state_ = "Initializing";
     std::atomic<int> packets_received_ {0};

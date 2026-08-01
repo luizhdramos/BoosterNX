@@ -274,7 +274,29 @@ void LaunchSessionDialog(
                     if (!launch_state->running.load())
                         return false;
                     if (s.status == "EN")
-                        post_progress(1, "Waiting in queue", "Boosteroid is queueing a machine for you.", 0.3f);
+                    {
+                        // queue_position is only ever set from the realtime
+                        // WebSocket's push (no REST endpoint reports it), so
+                        // it stays -1 until the first one arrives — keep the
+                        // old generic wording for that window rather than
+                        // showing a meaningless "position -1".
+                        if (s.queue_position >= 0)
+                        {
+                            // "Position in queue:{0}" is an existing key with
+                            // translations already present in localization.cpp
+                            // (inherited from SwitchNOW's GFN queue UI) — reuse
+                            // it rather than introducing an untranslated string.
+                            std::string detail = TrFormat("Position in queue:{0}",
+                                                          {" " + std::to_string(s.queue_position)});
+                            if (s.queue_eta_seconds > 0)
+                                detail += "  |  ~" + std::to_string((s.queue_eta_seconds + 59) / 60) + " min";
+                            post_progress(1, "Waiting in queue", detail, 0.3f);
+                        }
+                        else
+                        {
+                            post_progress(1, "Waiting in queue", "Boosteroid is queueing a machine for you.", 0.3f);
+                        }
+                    }
                     else if (s.status == "UN" || s.status == "confirmed")
                         post_progress(2, "Setting up your machine", "The machine was reserved and is booting.", 0.6f);
                     else if (s.status == "LI")

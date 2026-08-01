@@ -31,7 +31,16 @@ void sdp_append_h264(char* sdp) {
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtcp-fb:96 nack");
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
-  sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1");
+  // BoosterNX patch: declare packetization-mode=1 (FU-A fragmentation).
+  // Upstream libpeer omits it, and RFC 6184 says an absent
+  // packetization-mode defaults to 0 ("single NAL unit mode") — CONFIRMED on
+  // real hardware 2026-07-31 that Boosteroid's server then echoes
+  // "packetization-mode=0" back in its answer. At 1080p a single keyframe NAL
+  // is tens of KB, far past any UDP MTU, so mode 0 leaves the server with no
+  // legal way to send one. libpeer's own RTP decoder already implements FU-A
+  // reassembly (rtp_decode_h264_fu_a in rtp.c), so mode 1 is what it should
+  // have been advertising all along; this is what every browser sends.
+  sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
   sdp_append(sdp, "a=ssrc:1 cname:webrtc-h264");
   sdp_append(sdp, "a=sendrecv");

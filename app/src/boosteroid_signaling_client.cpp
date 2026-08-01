@@ -1,5 +1,6 @@
 #include "boosteroid_signaling_client.hpp"
 #include "json_utils.hpp"
+#include "runtime_journal.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -174,9 +175,35 @@ void BoosteroidSignalingClient::SendIceCandidate(const std::string& candidate, c
     const std::string body = dump ? dump : "{}";
     if (dump)
         free(dump);
-    // Fire-and-forget, matching the Swift client — a failure here just means
-    // one fewer candidate reaches the server; not worth failing the session.
-    http_client_.Post(BuildUrl("addIceCandidate", true), kUserAgent, AuthHeaders(true), body);
+    // Fire-and-forget as far as the session's fate goes (matching the Swift
+    // client — a failure here just means one fewer candidate reaches the
+    // server), but NOT silent: real hardware testing 2026-07-31 saw every
+    // addIceCandidate come back HTTP 500 while the stream then received zero
+    // packets, and the response body was being discarded, so there was
+    // nothing to diagnose from. The exact request body shape here is
+    // UNCONFIRMED (assumed from the upstream webrtc-streamer OSS convention,
+    // see this class's header) — logging what we sent alongside what the
+    // server said back is what will confirm or refute it.
+    try
+    {
+        const HttpResponse response =
+            http_client_.Post(BuildUrl("addIceCandidate", true), kUserAgent, AuthHeaders(true), body);
+        if (response.status_code < 200 || response.status_code >= 300)
+        {
+            LogRuntimeEvent("webrtc", "add_ice_candidate_failed",
+                             "status=" + std::to_string(response.status_code) +
+                             " response=" + Preview(response.body, 120) +
+                             " sent=" + Preview(body, 200));
+        }
+        else
+        {
+            LogRuntimeEvent("webrtc", "add_ice_candidate_ok", Preview(candidate, 120));
+        }
+    }
+    catch (const std::exception& ex)
+    {
+        LogRuntimeEvent("webrtc", "add_ice_candidate_error", ex.what());
+    }
 }
 
 std::vector<BoosteroidSignalingClient::RemoteCandidate> BoosteroidSignalingClient::PollRemoteIceCandidates() const
@@ -196,7 +223,20 @@ std::vector<BoosteroidSignalingClient::RemoteCandidate> BoosteroidSignalingClien
 
     JsonPtr root = TryLoad(response.body);
     if (!root || !json_is_array(root.get()))
+    {
+        // Logged once per distinct body rather than every poll (this runs on
+        // a ~1s timer): a shape mismatch here would silently drop EVERY
+        // remote candidate, which looks identical to "the server sent none"
+        // and would perfectly explain a peer that never connects. The
+        // response shape is UNCONFIRMED (OSS convention) — see the header.
+        static std::string last_unparsed;
+        if (response.body != last_unparsed)
+        {
+            last_unparsed = response.body;
+            LogRuntimeEvent("webrtc", "remote_candidates_unparsed", Preview(response.body, 200));
+        }
         return result;
+    }
 
     size_t index = 0;
     json_t* item = nullptr;
@@ -210,6 +250,24 @@ std::vector<BoosteroidSignalingClient::RemoteCandidate> BoosteroidSignalingClien
         remote.sdp_mid = GetString(item, "sdpMid");
         remote.sdp_mline_index = GetInteger(item, "sdpMLineIndex");
         result.push_back(std::move(remote));
+    }
+
+    // Same rationale: log only when the set actually changes, so a 1s poll
+    // loop doesn't flood runtime.log across a whole session.
+    static std::string last_summary;
+    std::string summary = "count=" + std::to_string(result.size());
+    for (const auto& remote : result)
+    {
+        const size_t typ = remote.candidate.find(" typ ");
+        summary += " [" + (typ == std::string::npos
+                               ? std::string("?")
+                               : remote.candidate.substr(typ + 5, remote.candidate.find(' ', typ + 5) - typ - 5)) +
+                   "]";
+    }
+    if (summary != last_summary)
+    {
+        last_summary = summary;
+        LogRuntimeEvent("webrtc", "remote_candidates", summary);
     }
     return result;
 }

@@ -123,6 +123,13 @@ struct SessionInfo
     // REQUIRED as the control WebSocket's auth (it's not just metadata) — see
     // boosteroid_control_channel.hpp.
     std::optional<std::string> query_string;
+    // Live queue position/ETA, pushed over the realtime WebSocket (NOT
+    // available from any REST endpoint — see BoosteroidClient::
+    // CreateAndAwaitSession). -1 means "unknown / not reported yet".
+    // Cosmetic only: the authoritative "are we still queued" signal is
+    // `status`, which comes from last-session polling.
+    int queue_position = -1;
+    int queue_eta_seconds = -1;
 
     bool IsQueued() const { return status == "EN"; }
     bool IsReserved() const { return status == "UN"; }

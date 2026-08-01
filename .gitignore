@@ -16,3 +16,9 @@ Thumbs.db
 
 # devkitPro/CMake local config
 CMakeUserPresets.json
+
+# Leftover SwitchNOW/GFN-era reference files — never compiled (excluded
+# explicitly in CMakeLists.txt's source list), kept locally only in case a
+# future feature (e.g. a public store catalog) needs to reference how GFN
+# did it. Not part of this project's own history, so kept out of git.
+/app/src/_legacy_gfn_reference/
