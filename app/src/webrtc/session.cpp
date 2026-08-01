@@ -341,6 +341,38 @@ void WebRtcSession::stop_ice_poll_worker() {
 
 void WebRtcSession::setup_peer_connection(const std::vector<IceServerInfo>& ice_servers_in) {
     std::vector<IceServerInfo> ice_servers = ice_servers_in;
+
+    // Derive a plain STUN URL from every TURN server Boosteroid gave us.
+    // A TURN server answers ordinary STUN Binding requests on the same
+    // host/port, so this costs nothing extra and — crucially — reuses a host
+    // we have already PROVEN reachable (the TURN ALLOCATE exchange with
+    // 87.121.118.69:3478 got a response within milliseconds on real
+    // hardware). The public Google STUN servers added below never produced a
+    // candidate at all on device, and the gather returned too fast for it to
+    // have been a network timeout, so DNS resolution of those hostnames is
+    // the likely failure — using a bare IP sidesteps that entirely.
+    //
+    // Why this matters (CONFIRMED 2026-07-31 from a real failed session):
+    // without an srflx candidate, the only address we advertise is our LAN
+    // IP (192.168.15.95). The peer's own candidates were its LAN IP plus a
+    // TURN *relay* (87.121.118.69:53172). A TURN relay only forwards packets
+    // from peers it has been given permission for, and the only addresses it
+    // could derive permission for were the unroutable ones we sent — so our
+    // packets were dropped and every candidate pair failed.
+    for (const auto& server : ice_servers_in)
+    {
+        if (server.url.rfind("turn:", 0) != 0)
+            continue;
+        // "turn:HOST:PORT?transport=udp" -> "stun:HOST:PORT"
+        std::string host_port = server.url.substr(5);
+        const size_t query = host_port.find('?');
+        if (query != std::string::npos)
+            host_port.erase(query);
+        if (host_port.empty())
+            continue;
+        ice_servers.push_back({"stun:" + host_port, "", ""});
+    }
+
     // ALWAYS append public STUN, not just when Boosteroid gave us nothing.
     // CONFIRMED root-cause evidence on real hardware 2026-07-31: getIceServers
     // returns exactly ONE server and it is a TURN one
@@ -357,8 +389,22 @@ void WebRtcSession::setup_peer_connection(const std::vector<IceServerInfo>& ice_
     // public IP/port, which is what the server actually needs. This is
     // additive and harmless if TURN also succeeds — ICE picks whichever pair
     // works and prefers the lower-latency one.
+    // Kept as a last resort behind the derived STUN above (libpeer's
+    // ice_servers array holds 5, and Boosteroid supplies 1). Harmless no-ops
+    // if their hostnames don't resolve on device, which is what appears to
+    // happen — see the comment above.
     ice_servers.push_back({"stun:stun.l.google.com:19302", "", ""});
     ice_servers.push_back({"stun:stun1.l.google.com:19302", "", ""});
+
+    {
+        std::string summary;
+        for (const auto& server : ice_servers) {
+            if (!summary.empty())
+                summary += ",";
+            summary += server.url;
+        }
+        opennow::LogRuntimeEvent("webrtc", "ice_servers_effective", summary);
+    }
 
     PeerConfiguration config = {};
     config.video_codec = CODEC_H264;

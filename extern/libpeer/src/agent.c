@@ -229,7 +229,15 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
     return -1;
   }
 
-  agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
+  // BoosterNX patch: upstream DISCARDED this call's return value, leaving
+  // `ret` holding the earlier agent_socket_send() result (always positive).
+  // So when the second ALLOCATE response never arrived, the check below
+  // passed anyway and the code went on to parse an empty recv buffer and
+  // manufacture a relay candidate out of zeroed memory. CONFIRMED on real
+  // hardware 2026-07-31: the local offer carried
+  //   "a=candidate:2 1 UDP 255 0.0.0.0 0 typ relay raddr 0.0.0.0 rport 0"
+  // — an unroutable garbage candidate that ICE then wasted checks on.
+  ret = agent_socket_recv_attempts(agent, NULL, recv_msg.buf, sizeof(recv_msg.buf), AGENT_STUN_RECV_MAXTIMES);
   if (ret <= 0) {
     LOGD("Failed to receive TURN Binding Response.");
     return ret;
