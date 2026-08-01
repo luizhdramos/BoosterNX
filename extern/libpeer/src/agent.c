@@ -179,8 +179,17 @@ static int agent_create_stun_addr(Agent* agent, Address* serv_addr) {
 
   stun_parse_msg_buf(&recv_msg);
   memcpy(&bind_addr, &recv_msg.mapped_addr, sizeof(Address));
+  // BoosterNX patch: same guard as the TURN path — a Binding response that
+  // carried no XOR-MAPPED-ADDRESS would otherwise become a 0.0.0.0 srflx
+  // candidate. Logged either way so runtime.log shows whether the STUN
+  // server answered at all (this is the step that currently yields nothing).
+  if (bind_addr.port == 0) {
+    LOGE("STUN Binding response carried no mapped address; no srflx candidate.");
+    return -1;
+  }
   IceCandidate* ice_candidate = agent->local_candidates + agent->local_candidates_count++;
   ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_SRFLX, &bind_addr);
+  LOGI("STUN srflx candidate created.");
   return ret;
 }
 
@@ -244,9 +253,24 @@ static int agent_create_turn_addr(Agent* agent, Address* serv_addr, const char* 
   }
 
   stun_parse_msg_buf(&recv_msg);
+  // BoosterNX patch: upstream never inspected this second response, so an
+  // error reply (stale nonce, bad credentials, ...) still fell through to
+  // building a relay candidate out of an all-zero relayed_addr. CONFIRMED on
+  // real hardware producing "typ relay ... 0.0.0.0 0". Reject it loudly
+  // instead — with LOG_REDIRECT on (see this dir's CMakeLists.txt) these
+  // lines reach runtime.log.
+  if (recv_msg.stunclass == STUN_CLASS_ERROR) {
+    LOGE("TURN ALLOCATE rejected by server (STUN error response); no relay candidate.");
+    return -1;
+  }
   memcpy(&turn_addr, &recv_msg.relayed_addr, sizeof(Address));
+  if (turn_addr.port == 0) {
+    LOGE("TURN ALLOCATE response carried no relayed address; no relay candidate.");
+    return -1;
+  }
   IceCandidate* ice_candidate = agent->local_candidates + agent->local_candidates_count++;
   ice_candidate_create(ice_candidate, agent->local_candidates_count, ICE_CANDIDATE_TYPE_RELAY, &turn_addr);
+  LOGI("TURN relay candidate allocated.");
   return ret;
 }
 

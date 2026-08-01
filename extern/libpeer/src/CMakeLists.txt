@@ -13,6 +13,15 @@ add_library(peer
 
 if(PLATFORM_SWITCH)
   target_compile_definitions(peer PRIVATE CONFIG_USE_USRSCTP=0)
+  # BoosterNX: route libpeer's own LOGD/LOGI/LOGE through peer_log(), which
+  # this app implements (app/src/webrtc/peer_log.cpp) to forward the ICE/STUN/
+  # TURN lines into runtime.log. Without this they go to stdout, which is
+  # nowhere on a Switch, leaving the whole candidate-gathering step a black
+  # box — exactly the step that has been failing (no srflx candidate, and a
+  # relay candidate built from an empty buffer). LEVEL_DEBUG is needed
+  # because the interesting failures ("Failed to receive STUN Binding
+  # Response") are LOGD; peer_log filters the noise on the app side.
+  target_compile_definitions(peer PRIVATE LOG_REDIRECT=1 LOG_LEVEL=LEVEL_DEBUG)
 endif()
 
 include_directories(peer PUBLIC

@@ -83,6 +83,7 @@ set(APP_SOURCES
     app/src/webrtc/input.cpp
     app/src/webrtc/log.cpp
     app/src/webrtc/media.cpp
+    app/src/webrtc/peer_log.cpp
     app/src/webrtc/session.cpp
     app/src/webrtc/shared.cpp
 )
